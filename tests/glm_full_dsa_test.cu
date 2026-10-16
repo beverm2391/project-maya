@@ -113,17 +113,18 @@ void hadamard(std::vector<double>& row) {
         }
     row = std::move(out);
 }
-void test_index() {
+void test_index(float eps) {
     constexpr int H = 32, D = 128, R = 64, POS = 3, C = POS+1;
-    auto q = data(H*D), k = data(D), w = data(D, 0.8f), b = data(D, 0.2f);
+    // Low key variance makes 1e-6 versus the trunk's 1e-5 observable.
+    auto q = data(H*D), k = data(D, 0.001f), w = data(D, 0.8f), b = data(D, 0.2f);
     auto cache = data(C*D, 0.7f), iw = data(H, 0.3f);
     Device<float> dq(q), dk(k), dw(w), db(b), dc(cache), di(iw), ds(C);
     const f::Rope r;
-    f::index_prepare(dq.p, dk.p, dw.p, db.p, dc.p, POS, H, D, R, 1e-5f, r, nullptr);
+    f::index_prepare(dq.p, dk.p, dw.p, db.p, dc.p, POS, H, D, R, eps, r, nullptr);
     std::vector<double> wantq(H*D), wantk(k.begin(), k.end());
     double mean = std::accumulate(k.begin(), k.end(), 0.0)/D, ss = 0;
     for (float v : k) ss += (v-mean)*(v-mean);
-    for (int i = 0; i < D; ++i) wantk[i] = (k[i]-mean)/std::sqrt(ss/D+1e-5f)*w[i]+b[i];
+    for (int i = 0; i < D; ++i) wantk[i] = (k[i]-mean)/std::sqrt(ss/D+eps)*w[i]+b[i];
     rope(wantk, 0, R, POS, r); hadamard(wantk);
     for (int h = 0; h < H; ++h) {
         std::vector<double> row(q.begin()+h*D, q.begin()+(h+1)*D);
@@ -221,7 +222,7 @@ void test_mla(int H, int N, int L, int R, int V, int S, bool all_padding = false
 }  // namespace
 
 int main() {
-    test_norm(); test_prepare(); test_index(); test_select();
+    test_norm(); test_prepare(); test_index(1e-6f); test_index(2.5e-4f); test_select();
     test_mla(3, 192, 512, 64, 256, 11); // real full-model dimensions
     test_mla(2, 4, 8, 4, 6, 2048);     // full top-k, padding, distinct rope/latent terms
     test_mla(1, 4, 8, 4, 6, 13, true);

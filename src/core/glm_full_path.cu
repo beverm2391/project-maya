@@ -38,7 +38,7 @@ bool Glm5Model::fast_full_dsa(int il, int64_t p, std::string& err) {
     if (index) {
         auto* keys = state_ + dsa_ik_[(size_t) il];
         fd::index_prepare(F->iq, F->ik_raw, L.k_norm_w, L.k_norm_b, keys, (int) p,
-                          g.idx_heads, g.idx_key, g.rope_dim, g.norm_eps, rope, s);
+                          g.idx_heads, g.idx_key, g.rope_dim, g.idx_norm_eps, rope, s);
         fd::score(F->iq, keys, F->iw, g.idx_key, g.idx_heads, (int) p + 1, F->score, s);
         fd::select(F->score, (int) p + 1, g.idx_top_k, F->cells, s);
     }

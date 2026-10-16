@@ -535,6 +535,8 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     out.sinkhorn_iters = (int) num("hyper_connection.sinkhorn_iterations", out.sinkhorn_iters, ok);
     out.hc_eps = (float) num("hyper_connection.epsilon", out.hc_eps, ok);
     out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", out.norm_eps, ok);
+    if (out.full_dsa)
+        out.idx_norm_eps = (float) num("attention.layer_norm_epsilon", out.idx_norm_eps, ok);
     out.n_expert = (int) num("expert_count", out.n_expert, ok);
     out.n_exp_used = (int) num("expert_used_count", out.n_exp_used, ok);
     out.n_ff_exp = (int) num("expert_feed_forward_length", out.n_ff_exp, ok);

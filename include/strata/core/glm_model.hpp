@@ -80,6 +80,7 @@ struct Glm5Geometry {
                                        // runner implements full indexers only and REFUSES the rest
     int hc = 4, sinkhorn_iters = 20;
     float hc_eps = 1e-6f, norm_eps = 1e-5f;
+    float idx_norm_eps = 1e-6f; // full GLM indexer LayerNorm is independent of the trunk RMSNorm
     int n_expert = 288, n_exp_used = 8, n_ff_exp = 2048, n_shared = 1, n_ff_dense = 12288, dense_lead = 3;
     float w_scale = 1.0f;
     int norm_w = 1;
