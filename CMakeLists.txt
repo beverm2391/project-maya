@@ -1,4 +1,6 @@
 ﻿# Strata Engine - top-level build (P1.S1).
+# loc-check: limit 1100
+# Preserve the existing upstream build layout while registering focused tests.
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -865,6 +867,13 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME glm_mv_nt_generic COMMAND glm_mv_nt_test)
     set_tests_properties(glm_mv_nt_generic PROPERTIES ENVIRONMENT STRATA_GLM_MV_GENERIC=1)
     set_tests_properties(glm_mv_nt_test glm_mv_nt_generic PROPERTIES TIMEOUT 300)
+    # Full GLM's 6144-wide decode projections and native IQ4_XS experts against
+    # independent dequantized CPU products, including unclamped SwiGLU.
+    add_executable(glm_full_quant_test tests/glm_full_quant_test.cu)
+    target_include_directories(glm_full_quant_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_full_quant_test PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
+    add_test(NAME glm_full_quant_test COMMAND glm_full_quant_test)
+    set_tests_properties(glm_full_quant_test PROPERTIES TIMEOUT 120)
   endif()
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
