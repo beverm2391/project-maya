@@ -1005,7 +1005,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // --expert-cache auto: the budget checked once written, before the prompt path sizes its chunk from it
         pool_check(floor_b, stride_max, all_b);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
-        if (!g.full_dsa && !prefill_setup(err)) return false;
+        if (!prefill_setup(err)) return false;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {

@@ -213,6 +213,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/glm_ffn.cu
                           src/kernels/cuda/glm_dsa.cu
                           src/kernels/cuda/glm_full_dsa.cu
+                          src/kernels/cuda/glm_full_batch.cu
                           src/kernels/cuda/qsa.cu
                           src/kernels/cuda/elementwise.cu
                           src/kernels/cuda/bf16_gemv.cu
@@ -257,6 +258,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_full_dsa_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_full_dsa_test COMMAND glm_full_dsa_test)
     set_tests_properties(glm_full_dsa_test PROPERTIES TIMEOUT 120)
+    add_executable(glm_full_batch_test tests/glm_full_batch_test.cu)
+    target_link_libraries(glm_full_batch_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_full_batch_test COMMAND glm_full_batch_test)
+    set_tests_properties(glm_full_batch_test PROPERTIES TIMEOUT 120)
     add_executable(glm_layer_graph_test tests/glm_layer_graph_test.cu)
     target_link_libraries(glm_layer_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_layer_graph_test COMMAND glm_layer_graph_test)
@@ -351,6 +356,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(glm_dflash_test tests/glm_dflash_test.cu)
     target_include_directories(glm_dflash_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(glm_dflash_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    add_executable(glm_full_prefill_diagnostic tests/glm_full_prefill_diagnostic.cpp)
+    target_include_directories(glm_full_prefill_diagnostic PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_full_prefill_diagnostic PRIVATE strata_engine ${_strata_gpu_runtime_target})
     add_executable(glm_geometry_test tests/glm_geometry_test.cpp)
     target_include_directories(glm_geometry_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(glm_geometry_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
@@ -957,6 +965,11 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(glm_mmq_glu_test PRIVATE strata_mmq strata_kernels ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME glm_mmq_glu_test COMMAND glm_mmq_glu_test)
       set_tests_properties(glm_mmq_glu_test PROPERTIES TIMEOUT 300)
+      # One actual full-GLM expert and a captured input; manual artifact-dependent
+      # oracle, so ordinary CTest never silently skips missing model weights.
+      add_executable(glm_full_expert_oracle tests/glm_full_expert_oracle.cu)
+      target_include_directories(glm_full_expert_oracle PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(glm_full_expert_oracle PRIVATE strata_mmq strata_kernels ggml-base ${_strata_gpu_runtime_target})
     endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses

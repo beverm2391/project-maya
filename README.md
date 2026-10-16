@@ -19,6 +19,11 @@ and SSD and tunes itself to them. Nothing leaves your machine.
   real users below.
 - **Close to the original:** Maya's own quants keep 97.7-99.2% of the FP8 model's zero-shot accuracy.
 - **Plugs into your tools:** OpenAI- and Anthropic-compatible API with tool calls, ready for coding agents.
+- **Full GLM experimental prompt batching:** `STRATA_GLM_FULL_PREFILL=1` enables the native `glm-dsa`
+  layer-major prompt path with `--prefill 128` or `--prefill 256` (`auto` caps its chunks at 256).
+  It borrows scratch from the expert pool and runs split parts serially. It is off by default;
+  omit the environment variable or use `--prefill 0` for tokenwise processing. Dense projections use FP16 GEMMs
+  while decode rounds activations to Q8_1, so logits and near-tied expert selections can differ.
 - **Several requests at once:** up to 8 answered together - for agents that run several sessions, or several people
   on one PC.
 - **Everything in the box:** a chat and a live monitor in the browser, pictures, thinking levels, a one-command setup.

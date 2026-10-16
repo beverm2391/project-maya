@@ -2,11 +2,13 @@
 // (retrieved 2026-10-16) and zai-org/GLM-5.3 config.json. No Flash k-pooling.
 // Stable radix top-k adapts this repository's dsa_topk.cuh to 2048 cells.
 #include "strata/kernels/glm_full_dsa.hpp"
+#include "strata/kernels/glm_full_batch.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -193,10 +195,21 @@ __device__ float bf16(uint16_t x) { return __uint_as_float((unsigned) x << 16); 
 // used by Flash's latent reader; keep software FP16 rounding for cache writes.
 // This changes neither stored bits nor the order of any attention arithmetic.
 __device__ __forceinline__ float latent_f32(uint16_t x) { return __half2float(__ushort_as_half(x)); }
+template<bool Rows>
 __global__ void mla_kernel(const float* q, const uint16_t* kb, const uint16_t* vb,
                            const uint16_t* cache, const int* cells, int nsel, int nope,
-                           int latent, int rope, int vhead, float scale, float* out) {
-    const int h = blockIdx.x, t = threadIdx.x;
+                           int latent, int rope, int vhead, float scale, float* out,
+                           int heads, int p0) {
+    const int h = Rows ? blockIdx.x % heads : blockIdx.x, t = threadIdx.x;
+    if constexpr (Rows) {
+        // Flatten (row,head) so long batches do not inherit CUDA grid.y's limit.
+        // Every block retains the token kernel's exact head-local arithmetic.
+        const int row = blockIdx.x / heads;
+        q += (size_t) row*heads*(nope+rope);
+        cells += (size_t) row*nsel; // nsel is the padded row stride until this point
+        out += (size_t) row*heads*vhead;
+        nsel = min(nsel, p0+row+1);
+    }
     extern __shared__ float buf[];
     float* probs = buf, *qa = buf+nsel, *ctx = qa+latent;
     const float* query = q + (size_t) h*(nope+rope);
@@ -289,7 +302,21 @@ void mla(const float* q, const uint16_t* kb, const uint16_t* vb, const uint16_t*
     require(nsel > 0 && nsel <= 2048 && heads > 0 && nope > 0 && latent > 0 && vhead > 0,
             "invalid MLA shape");
     const size_t bytes = (size_t) (nsel+2*latent)*sizeof(float);
-    mla_kernel<<<heads, NT, bytes, (cudaStream_t) stream>>>(q, kb, vb, cache, cells, nsel, nope, latent, rope, vhead, scale, out);
+    mla_kernel<false><<<heads, NT, bytes, (cudaStream_t) stream>>>(q, kb, vb, cache, cells, nsel, nope,
+        latent, rope, vhead, scale, out, heads, 0);
+    check();
+}
+void mla_rows(const float* q, const uint16_t* kb, const uint16_t* vb,
+              const uint16_t* cache, const int* cells, int p0, int T, int topk,
+              int heads, int nope, int latent, int rope, int vhead, float scale,
+              float* out, void* stream) {
+    require(p0 >= 0 && T >= 0 && (int64_t) p0+T <= INT_MAX && topk > 0 && topk <= 2048 &&
+            heads > 0 && (int64_t) T*heads <= INT_MAX && nope > 0 && latent > 0 && vhead > 0,
+            "invalid batched MLA shape");
+    if (T == 0) return;
+    const size_t bytes = (size_t) (topk+2*latent)*sizeof(float);
+    mla_kernel<true><<<T*heads, NT, bytes, (cudaStream_t) stream>>>(q, kb, vb, cache, cells, topk, nope,
+        latent, rope, vhead, scale, out, heads, p0);
     check();
 }
 }  // namespace strata::kernels::full_glm_dsa
