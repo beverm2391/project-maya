@@ -1035,9 +1035,10 @@ static int glm_pack_generate(const Options& o) {
         // INFO facts for the server's Monitor tab (strata app): the expert tiers this engine runs with
         const auto st = model.fast_stats();
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
-        std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
+        std::printf("INFO architecture=%s context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
                     "cpu_threads=%d pcie_share=%.2f logit_bias=1\n",
+                    model.geometry().full_dsa ? "glm-dsa" : "glm5-next",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
@@ -1195,6 +1196,9 @@ static int glm_pack_generate(const Options& o) {
         // a paused request's prompt (PAUSE keep): the next turn of that chat continues it, not the written answer
         // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
         bool anchor = false;
+        // the end of a system prompt (slot_prefix): other chats start with it, so its conversation's later states
+        // never supersede it - it goes only as the least recently used (#179)
+        bool prefix = false;
     };
     // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
     // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
@@ -1352,7 +1356,7 @@ static int glm_pack_generate(const Options& o) {
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages) return;
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (!slots[i].anchor && slots[i].tokens.size() <= snap_tokens.size() &&
+            if (!slots[i].anchor && !slots[i].prefix && slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
@@ -1499,6 +1503,23 @@ static int glm_pack_generate(const Options& o) {
             if (p >= (kept.empty() ? from : kept.back()) + 64) kept.push_back(p);
         return kept;
     };
+    // ... and with the disk slots on, the state at the end of the system prompt (p) also into a slot of its own: the
+    // checkpoints live with the model's state, so an unrelated conversation in between drops them, and another chat
+    // with this system prompt read it all again (#179); the slot outlives that.  Once per system prompt.
+    const auto slot_prefix = [&](const std::vector<int32_t>& prompt, size_t p) {
+        if (slot_max <= 0 || p < slot_min || !cur_img_pos.empty()) return;
+        for (auto& sl : slots)
+            if (sl.prefix && sl.tokens.size() == p && std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin())) {
+                sl.used = ++slot_clock;
+                return;
+            }
+        if (!model.snapshot_save()) return;
+        snap_tokens.assign(prompt.begin(), prompt.begin() + (long) p);
+        snap_img_hash = img_hash(p);
+        snap_in_slot = false;
+        slot_put(" (its system prompt, for other chats that start with it)");
+        if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
+    };
     // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
     const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
@@ -1631,6 +1652,9 @@ static int glm_pack_generate(const Options& o) {
                 std::fflush(stdout);
             };
             const std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
+            size_t sys_end = 0;  // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
+            for (size_t i = 1; i < prompt.size() && sys_end == 0; ++i)
+                if (prompt[i] == 154827) sys_end = i;   // <|user|>
             size_t at = reuse;   // the next token the prompt path reads
             bool pok = true;
             for (size_t si = 0; si <= marks.size() && pok; ++si) {
@@ -1647,6 +1671,7 @@ static int glm_pack_generate(const Options& o) {
                 if (pok) {
                     at = end;
                     if (si < marks.size()) ckpt_keep(prompt, end);
+                    if (si < marks.size() && end == sys_end) slot_prefix(prompt, end);
                 }
             }
             // a call the prompt path did not take (fewer tokens than STRATA_GLM_PREFILL_MIN: false, no error) leaves the

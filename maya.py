@@ -19,8 +19,9 @@ and Maya in the terminal as before; --yes: the setup in plain text.
 
 What the first run does (each step is skipped when it is already done):
 
-  1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+, driver, CUDA toolkit (nvcc), the C++ compiler (g++;
-     on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
+  1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+ (6.x, Pascal: experimental), driver, CUDA toolkit (nvcc),
+     the C++ compiler (g++; on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD
+     gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
      Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits, experimental
@@ -77,7 +78,8 @@ STAMP = BUILD / "MAYA-BUILD.json"                  # what the engine in build/ w
 VBUILD = ROOT / "build-vision"
 VEXE = VBUILD / "bin" / ("strata-vision.exe" if WIN else "strata-vision")  # the image encoder (llama.cpp's mtmd)
 VSTAMP = VBUILD / "MAYA-BUILD.json"
-MIN_CC = 70                                        # Volta (V100) and newer (the GLM path; see arch_setting)
+MIN_CC = 60                                        # Pascal and newer (the GLM path; see arch_setting) ...
+VALIDATED_CC = 70                                  # ... Volta (V100) and newer validated, Pascal experimental (#212)
 MAX_GPUS = 16                                      # the layer split's parts at most (glm_model.hpp, kMaxParts)
 HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix Halo (unified memory)
 HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
@@ -668,11 +670,8 @@ def check_hip_pc(a, installed=False) -> dict:
         for i, g in zip(want, picked):
             if g is None:
                 fail(f"GPU {i} is not a supported AMD card")
-        apu = next((g for g in picked if hip_unified_memory(g)), None)
-        if apu is not None:
-            fail(f"GPU {apu['index']} ({apu['name']}) is an APU with unified memory, which stays single-GPU",
-                 "use --gpu N for it, or pick two discrete cards with --gpus")
-        chosen = sorted(picked, key=lambda g: -g["vram_gb"])
+        # A mixed pair puts the discrete GPU first and the unified-memory APU last.
+        chosen = sorted(picked, key=lambda g: (hip_unified_memory(g), -g["vram_gb"]))
     else:
         one = next((g for g in usable if g["index"] == a.gpu), None) if a.gpu is not None else max(
             usable, key=lambda g: g["vram_gb"])
@@ -746,7 +745,7 @@ def check_hip_pc(a, installed=False) -> dict:
 def nvcc_range(archs) -> tuple:
     """The CUDA toolkit versions that can build for these GPUs: (lowest, first too new or None)."""
     lo = (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell needs 12.8
-    hi = (13, 0) if min(archs) < 75 else None       # CUDA 13 no longer compiles for Volta (sm_70)
+    hi = (13, 0) if min(archs) < 75 else None       # CUDA 13 no longer compiles for Volta (sm_70) or Pascal (sm_6x)
     return lo, hi
 
 
@@ -786,9 +785,10 @@ def toolkit_hint(archs) -> str:
     if WIN:
         return ("NVIDIA's CUDA Toolkit 12.8 for Windows (the driver can stay as it is): "
                 "https://developer.nvidia.com/cuda-12-8-0-download-archive" +
-                (" - Volta (V100) needs 12.x, CUDA 13 dropped it" if min(archs) < 75 else ""))
+                (" - Volta (V100) and Pascal need 12.x, CUDA 13 dropped them" if min(archs) < 75 else ""))
     if min(archs) < 75:
-        return ("Volta (V100) needs CUDA 12.x - Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit (CUDA 12.0), "
+        return ("Volta (V100) and Pascal need CUDA 12.x - Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit "
+                "(CUDA 12.0), "
                 "or NVIDIA's cuda-toolkit-12-8 package: https://developer.nvidia.com/cuda-12-8-0-download-archive")
     if max(archs) >= 100:
         return "NVIDIA's cuda-toolkit-12-8 (or newer) package: https://developer.nvidia.com/cuda-downloads"
@@ -827,7 +827,9 @@ def choose_gpus(a, found) -> list:
                      "use one of: " + ", ".join(str(g["index"]) for g in usable))
         return [byid[i] for i in want]
     if not usable:
-        fail("none of the GPUs can run Maya", "it needs an NVIDIA GPU of compute capability 7.0 or newer (V100 and newer)")
+        fail("none of the GPUs can run Maya",
+             "it needs an NVIDIA GPU of compute capability 7.0 or newer (V100 and newer; "
+             "Pascal - Tesla P40 / P100, GTX 10 - is experimental)")
     best = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
     if len(best) == 1:
         return best
@@ -870,8 +872,9 @@ def check_pc(a) -> dict:
               "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
     say("  NVIDIA GPUs:")
     for g in found:
-        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= MIN_CC else
-                                       "too old (Maya needs compute capability 7.0 or newer)"))
+        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= VALIDATED_CC else
+                                       "can be used (Pascal: experimental)" if int(g["arch"]) >= MIN_CC else
+                                       "too old (Maya needs compute capability 6.0 or newer)"))
     chosen = choose_gpus(a, found)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
@@ -880,11 +883,16 @@ def check_pc(a) -> dict:
     if vram < 23:
         say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
             "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
+    if min(archs) < VALIDATED_CC:
+        warn("Pascal (compute capability 6.x) is experimental: the engine builds for it with its portable kernels "
+             "(the prompt attention on the F32 cores) and caches global loads in L1 there, but Maya has not been "
+             "validated on such a card yet - tell us how it goes in an issue")
     problems = []                                      # (what is wrong, how to fix it): all of them at once
 
     nvcc, nv = find_nvcc(archs, a.nvcc)
     lo, hi = nvcc_range(archs)
-    want = f"CUDA {lo[0]}.{lo[1]} or newer" + (f" but older than {hi[0]}.0 (CUDA 13 dropped Volta)" if hi else "")
+    want = f"CUDA {lo[0]}.{lo[1]} or newer" + (
+        f" but older than {hi[0]}.0 (CUDA 13 dropped Volta and Pascal)" if hi else "")
     if nvcc is None:
         problems.append((f"the CUDA toolkit (nvcc) is not installed; these GPUs need {want}", toolkit_hint(archs)))
     elif nv is None:
@@ -1127,9 +1135,10 @@ def cached_generator():
 
 def arch_setting(archs) -> str:
     """CMAKE_CUDA_ARCHITECTURES for these GPUs.  CMakeLists.txt refuses an explicit arch below 75 (Strata's own
-    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those the build
-    asks CMake for this machine's own GPUs ("native", which the guard leaves to CMake), with CUDA_VISIBLE_DEVICES
-    limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix that makes this unnecessary."""
+    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those (and Pascal's
+    sm_6x, experimental) the build asks CMake for this machine's own GPUs ("native", which the guard leaves to
+    CMake), with CUDA_VISIBLE_DEVICES limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix
+    that makes this unnecessary."""
     return ";".join(str(x) for x in archs) if min(archs) >= 75 else "native"
 
 
@@ -1151,8 +1160,9 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
                 "2022 (its Build Tools are enough);" if WIN else
                 "common causes: 'unsupported GNU version' - install an older g++ your CUDA accepts (e.g. g++-13) and run "
                 "again (it is found by itself), or pass --host-compiler g++-13;") + (
-                "\n       'Unsupported gpu architecture compute_70' - CUDA 13 cannot build for Volta, "
-                "install CUDA 12.x;\n       the compiler killed (out of memory) - close programs and run it again "
+                "\n       'Unsupported gpu architecture compute_70' (or compute_61) - CUDA 13 cannot build for Volta "
+                "or Pascal, install CUDA 12.x;\n       the compiler killed (out of memory) - close programs and run it "
+                "again "
                 "(it continues)")
         if soft:
             warn(msg + "; starting the engine compiled before")
@@ -1948,7 +1958,10 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
-        if any(hip_unified_memory(g) for g in gpus):   # an APU is always the only GPU (check_hip_pc)
+        if any(hip_unified_memory(g) for g in gpus):
+            if len(gpus) > 1:
+                # Pin the first part's RAM tier before the APU measures the shared memory left.
+                hip_env["STRATA_GLM_PARALLEL_LOAD"] = "0"
             total_ram, _ = mem_gb()
             if WIN:     # Windows counts the GPU's carve-out apart from its RAM, and its desktop runs on that GPU
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)

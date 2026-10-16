@@ -3341,6 +3341,22 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def chat_template_path(tokenizer_dir: Path, architecture: str = "") -> Path:
+    """Keep full GLM's pack template; the shipped replacement was qualified for Flash.
+
+    Both templates match the GLM text heuristic, so use the loaded architecture
+    rather than treating that resemblance as evidence of interchangeable prompts.
+    """
+    tpl = tokenizer_dir / "chat_template.jinja"
+    tpl = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
+    glm5 = ROOT / "serve/glm5_chat_template.jinja"
+    if architecture != "glm-dsa" and glm5.exists() and os.environ.get("MAYA_PACK_TEMPLATE") != "1" and tpl != glm5:
+        head = tpl.read_text(encoding="utf-8", errors="replace")
+        if head.startswith("[gMASK]<sop>") and "reasoning_effort in ['low', 'high']" in head:
+            return glm5
+    return tpl
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -3441,9 +3457,11 @@ def main() -> int:
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    # The loaded engine identifies the architecture even for hand-written configs.
+    # Installer configs also carry it, so mock/older-engine starts use that fact.
+    architecture = str((getattr(engine, "info", {}) or {}).get("architecture") or cfg.get("architecture") or "")
+    tpl = chat_template_path(tpath, architecture)
+    svc = Service(engine, tok, ChatTemplate(tpl),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
