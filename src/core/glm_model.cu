@@ -1358,8 +1358,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const double lat_rows = (double) (kv_cells > 0 ? kv_cells : max_ctx);
     const double lat = fast ? (double) (g.kv_lora + g.rope_dim) * lat_rows / 2 : (double) g.kv_lora * lat_rows;
     const size_t kv_stage = kv_cells > 0 ? (size_t) g.kv_lora * 2 * (size_t) max_ctx : 0;
-    const double dsa_state = 4.0 * (lat + (g.full_dsa ? 1.0 : 2.0) * g.idx_key * (double) max_ctx +
-                                          (g.full_dsa ? 0.0 : (double) g.idx_key * max_pools));
+    // Flash's compressed indexer owns keys/gates and pooled keys. Full GLM
+    // charges its uncompressed key cache only on layers marked indexer_full.
+    const double compressed_dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx +
+                                              (double) g.idx_key * max_pools);
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // a DFlash drafter (STRATA_GLM_DFLASH): its file and ring on the last part; every part keeps the verify window's
     // buffers - per KDA layer its state backup and the window's inputs, and ~32 MB of rows and logits
@@ -1562,7 +1564,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         double bsum = 0, ssum = 0, smax = 0;
         bool kda = false, dsa = false, dense_ffn = false, moe = false;
         for (int l = lb; l < le; ++l) {
-            used += dense[(size_t) l] + (g.is_recr(l) ? kda_state + win_kda : dsa_state);
+            const double state = g.is_recr(l) ? kda_state + win_kda
+                : g.full_dsa ? (double) g.full_dsa_cache_bytes(l, max_ctx) : compressed_dsa_state;
+            used += dense[(size_t) l] + state;
             (g.is_recr(l) ? kda : dsa) = true;
             if (moe_layer(l)) {
                 bsum += blob[(size_t) l];
@@ -1576,7 +1580,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (last) {
             used += head + dflash;
             if (mtp) {
-                used += mtp_dense + dsa_state;
+                used += mtp_dense + compressed_dsa_state;
                 bsum += blob[(size_t) L];
                 ssum += stride[(size_t) L];
                 smax = std::max(smax, stride[(size_t) L]);

@@ -75,9 +75,8 @@ struct Glm5Geometry {
     float kda_lb = -5.0f;
     int idx_heads = 32, idx_key = 128, idx_top_k = 2048, idx_kpool = 4;
     int idx_select_tail = 1;
-    std::vector<int> indexer_full;     // per layer; the arch allows a non-full DSA layer to reuse
-                                       // the previous full layer's selection (prev_sel) - this
-                                       // runner implements full indexers only and REFUSES the rest
+    std::vector<int> indexer_full;     // full GLM shared layers reuse the previous full layer's selection;
+                                       // Flash requires a full compressed indexer on every DSA layer
     int hc = 4, sinkhorn_iters = 20;
     float hc_eps = 1e-6f, norm_eps = 1e-5f;
     float idx_norm_eps = 1e-6f; // full GLM indexer LayerNorm is independent of the trunk RMSNorm
@@ -90,6 +89,14 @@ struct Glm5Geometry {
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return full_dsa ? idx_top_k : idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
     bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
+
+    // Resident full-GLM state: every layer keeps FP16 [latent|RoPE] rows;
+    // only full indexers keep F32 key rows. Shared layers allocate no keys.
+    // The split search uses this per-layer cost, matching load_pack's layout.
+    uint64_t full_dsa_cache_bytes(int il, int64_t context) const {
+        return (uint64_t) context * (2ull * (kv_lora + rope_dim) +
+            (indexer_full[(size_t) il] ? 4ull * idx_key : 0));
+    }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
