@@ -229,14 +229,40 @@ __global__ void mla_kernel(const float* q, const uint16_t* kb, const uint16_t* v
         probs[s] = dot*scale;
     }
     __syncthreads();
-    if (t == 0) {
-        float mx = -INFINITY, denom = 0;
-        for (int s = 0; s < nsel; ++s) mx = fmaxf(mx, probs[s]);
-        for (int s = 0; s < nsel; ++s) {
-            probs[s] = probs[s] == -INFINITY ? 0 : expf(probs[s]-mx);
-            denom += probs[s];
+    if constexpr (Rows) {
+        // Row grids already fill the GPU. The original serial softmax avoids
+        // extra block barriers and measures faster in that throughput regime.
+        if (t == 0) {
+            float mx = -INFINITY, denom = 0;
+            for (int s = 0; s < nsel; ++s) mx = fmaxf(mx, probs[s]);
+            for (int s = 0; s < nsel; ++s) {
+                probs[s] = probs[s] == -INFINITY ? 0 : expf(probs[s]-mx);
+                denom += probs[s];
+            }
+            for (int s = 0; s < nsel; ++s) probs[s] = denom > 0 ? probs[s]/denom : 0;
         }
-        for (int s = 0; s < nsel; ++s) probs[s] = denom > 0 ? probs[s]/denom : 0;
+    } else {
+        __shared__ float softmax_max, softmax_denom;
+        if (t == 0) {
+            float mx = -INFINITY;
+            for (int s = 0; s < nsel; ++s) mx = fmaxf(mx, probs[s]);
+            softmax_max = mx;
+        }
+        __syncthreads();
+        // These elementwise operations are independent. Keep the original expf
+        // and division, and the denominator's left-to-right F32 sum on one thread;
+        // parallel work changes scheduling, not any value's arithmetic order.
+        for (int s = t; s < nsel; s += NT)
+            probs[s] = probs[s] == -INFINITY ? 0 : expf(probs[s]-softmax_max);
+        __syncthreads();
+        if (t == 0) {
+            float denom = 0;
+            for (int s = 0; s < nsel; ++s) denom += probs[s];
+            softmax_denom = denom;
+        }
+        __syncthreads();
+        for (int s = t; s < nsel; s += NT)
+            probs[s] = softmax_denom > 0 ? probs[s]/softmax_denom : 0;
     }
     __syncthreads();
     for (int c = t; c < latent; c += NT) {

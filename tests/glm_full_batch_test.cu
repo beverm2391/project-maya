@@ -172,10 +172,12 @@ template<class Call> double time_ms(Call run) {
     ck(cudaEventDestroy(start)); ck(cudaEventDestroy(stop));
     return ms/repeats;
 }
-void bench_rows() {
+void bench_rows(const char* capture_path = nullptr) {
     constexpr int H = 64, N = 192, L = 512, R = 64, V = 256, K = 2048, P0 = 2047;
     auto kb = bf16(data((size_t) H*L*N, 0.03f, 2)), vb = bf16(data((size_t) H*V*L, 0.04f, 5));
     Device<uint16_t> dkb(kb), dvb(vb);
+    FILE* capture = capture_path ? std::fopen(capture_path, "wb") : nullptr;
+    if (capture_path && !capture) { std::perror("MLA row capture"); std::exit(1); }
     std::puts("full MLA row-launch timing: 2 warmups, 5 repetitions, CUDA events, no transfers");
     std::puts("rows selected serial_ms batch_ms speedup batch_ms_per_row");
     for (int T : {32, 128}) {
@@ -198,14 +200,20 @@ void bench_rows() {
                          0.0625f, batch_out.p, nullptr);
         };
         serial(); batch();
-        same("row-batched MLA vs per-row launches", batch_out.get(), serial_out.get());
+        const auto serial_values = serial_out.get(), batch_values = batch_out.get();
+        same("row-batched MLA vs per-row launches", batch_values, serial_values);
+        if (capture && std::fwrite(batch_values.data(), sizeof(float), batch_values.size(), capture) != batch_values.size()) {
+            std::perror("MLA row capture write"); std::exit(1);
+        }
         const double old_ms = time_ms(serial), new_ms = time_ms(batch);
         std::printf("%d %d %.4f %.4f %.3f %.5f\n", T, K, old_ms, new_ms, old_ms/new_ms, new_ms/T);
     }
+    if (capture && std::fclose(capture)) { std::perror("MLA row capture close"); std::exit(1); }
 }
 }  // namespace
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) { bench_rows(); return 0; }
+    if (argc == 3 && std::strcmp(argv[1], "--bench-save") == 0) { bench_rows(argv[2]); return 0; }
     norm_rows();
     attention(0, 4, 3);
     attention(3, 4, 4);
