@@ -4,6 +4,7 @@
 #include "strata/kernels/glm_full_dsa.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -219,9 +220,98 @@ void test_mla(int H, int N, int L, int R, int V, int S, bool all_padding = false
     }
     close("MLA vs decompressed K/V (BF16 weights, FP16 KV)", dout.get(), want, 3e-5, 3e-5);
 }
+
+__global__ void half_read_kernel(float* out) {
+    const unsigned i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i < 65536) out[i] = __half2float(__ushort_as_half((uint16_t) i));
+}
+void test_half_read() {
+    Device<float> output(65536);
+    half_read_kernel<<<256, 256>>>(output.p);
+    ck(cudaGetLastError());
+    const auto got = output.get();
+    int exact = 0, nans = 0;
+    for (int i = 0; i < 65536; ++i) {
+        const float want = f32_from_f16((uint16_t) i);
+        if (std::isnan(want)) {
+            if (!std::isnan(got[i])) { std::fprintf(stderr, "FP16 NaN lost: 0x%04x\n", i); std::exit(1); }
+            ++nans; // hardware may quiet a signaling NaN; payload bits are not arithmetic values
+        } else {
+            if (std::memcmp(&got[i], &want, sizeof(float))) {
+                std::fprintf(stderr, "FP16 conversion differs: 0x%04x got%.9g want%.9g\n", i, got[i], want);
+                std::exit(1);
+            }
+            ++exact;
+        }
+    }
+    std::printf("FP16 hardware read: %d finite/Inf encodings bit-exact, %d NaNs preserved\n", exact, nans);
+}
+
+template<class Call> double time_us(Call run) {
+    constexpr int repeats = 32;
+    for (int i = 0; i < 5; ++i) run();
+    cudaEvent_t start, stop;
+    ck(cudaEventCreate(&start)); ck(cudaEventCreate(&stop));
+    ck(cudaEventRecord(start));
+    for (int i = 0; i < repeats; ++i) run();
+    ck(cudaEventRecord(stop)); ck(cudaEventSynchronize(stop));
+    float ms = 0;
+    ck(cudaEventElapsedTime(&ms, start, stop));
+    ck(cudaEventDestroy(start)); ck(cudaEventDestroy(stop));
+    return ms*1000.0/repeats;
+}
+void bench(const char* capture_path = nullptr) {
+    constexpr int H = 64, N = 192, L = 512, R = 64, V = 256, IH = 32, IK = 128;
+    auto kb_f = data((size_t) H*L*N, 0.03f), vb_f = data((size_t) H*V*L, 0.04f);
+    std::vector<uint16_t> kb(kb_f.size()), vb(vb_f.size());
+    for (size_t i = 0; i < kb.size(); ++i) kb[i] = bf_bits(kb_f[i]);
+    for (size_t i = 0; i < vb.size(); ++i) vb[i] = bf_bits(vb_f[i]);
+    Device<uint16_t> dk(kb), dv(vb);
+    Device<float> dq(data(H*(N+R), 0.1f)), diq(data(IH*IK, 0.3f)), diw(data(IH, 0.2f)), dout(H*V);
+    FILE* capture = capture_path ? std::fopen(capture_path, "wb") : nullptr;
+    if (capture_path && !capture) { std::perror("MLA capture"); std::exit(1); }
+    std::puts("full DSA synthetic warm-cache CUDA-event timings (5 warmups, 32 repetitions; no transfers)");
+    std::puts("context selected score_us select_us mla_us model_attention_ms[21*(score+select)+78*mla]");
+    for (int context : {512, 2048, 8192}) {
+        const int selected = std::min(context, 2048);
+        auto lat_f = data((size_t) context*(L+R), 0.4f);
+        std::vector<uint16_t> lat(lat_f.size());
+        for (size_t i = 0; i < lat.size(); ++i) lat[i] = f16_from_f32(lat_f[i]);
+        Device<uint16_t> dc(lat);
+        Device<float> keys(data((size_t) context*IK, 0.3f)), scores(context);
+        Device<int> cells(selected);
+        auto score = [&] { f::score(diq.p, keys.p, diw.p, IK, IH, context, scores.p, nullptr); };
+        auto select = [&] { f::select(scores.p, context, 2048, cells.p, nullptr); };
+        auto mla = [&] { f::mla(dq.p, dk.p, dv.p, dc.p, cells.p, selected, H, N, L, R, V, 0.0625f, dout.p, nullptr); };
+        const double sc = time_us(score), sel = time_us(select), attn = time_us(mla);
+        // Keep timing honest: top-k agrees with independent CPU stable sorting,
+        // and every attention output is finite. Detailed math is pinned above.
+        const auto hs = scores.get();
+        const auto hc = cells.get();
+        std::vector<int> order(context);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return hs[a] > hs[b]; });
+        if (!std::equal(hc.begin(), hc.end(), order.begin())) {
+            std::fprintf(stderr, "timing fixture selection mismatch\n"); std::exit(1);
+        }
+        const auto values = dout.get();
+        for (float v : values) if (!std::isfinite(v)) {
+            std::fprintf(stderr, "timing fixture nonfinite output\n"); std::exit(1);
+        }
+        if (capture && std::fwrite(values.data(), sizeof(float), values.size(), capture) != values.size()) {
+            std::perror("MLA capture write"); std::exit(1);
+        }
+        std::printf("%d %d %.3f %.3f %.3f %.3f\n", context, selected, sc, sel, attn,
+                    (21*(sc+sel)+78*attn)/1000);
+    }
+    if (capture && std::fclose(capture)) { std::perror("MLA capture close"); std::exit(1); }
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) { bench(); return 0; }
+    if (argc == 3 && std::strcmp(argv[1], "--bench-save") == 0) { bench(argv[2]); return 0; }
+    test_half_read();
     test_norm(); test_prepare(); test_index(1e-6f); test_index(2.5e-4f); test_select();
     test_mla(3, 192, 512, 64, 256, 11); // real full-model dimensions
     test_mla(2, 4, 8, 4, 6, 2048);     // full top-k, padding, distinct rope/latent terms

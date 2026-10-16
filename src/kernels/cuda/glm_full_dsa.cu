@@ -5,6 +5,7 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -188,6 +189,10 @@ __global__ void select_kernel(const float* scores, int ncache, int top, int* cel
     for (int i = t; i < top; i += NT) cells[i] = (int) ~(unsigned) winners[i];
 }
 __device__ float bf16(uint16_t x) { return __uint_as_float((unsigned) x << 16); }
+// FP16 -> F32 is exact, including subnormals. Use the hardware conversion already
+// used by Flash's latent reader; keep software FP16 rounding for cache writes.
+// This changes neither stored bits nor the order of any attention arithmetic.
+__device__ __forceinline__ float latent_f32(uint16_t x) { return __half2float(__ushort_as_half(x)); }
 __global__ void mla_kernel(const float* q, const uint16_t* kb, const uint16_t* vb,
                            const uint16_t* cache, const int* cells, int nsel, int nope,
                            int latent, int rope, int vhead, float scale, float* out) {
@@ -206,8 +211,8 @@ __global__ void mla_kernel(const float* q, const uint16_t* kb, const uint16_t* v
         if (cell < 0) { probs[s] = -INFINITY; continue; }
         const uint16_t* row = cache + (size_t) cell*(latent+rope);
         float dot = 0;
-        for (int c = 0; c < latent; ++c) dot += qa[c]*f32_from_f16(row[c]);
-        for (int c = 0; c < rope; ++c) dot += query[nope+c]*f32_from_f16(row[latent+c]);
+        for (int c = 0; c < latent; ++c) dot += qa[c]*latent_f32(row[c]);
+        for (int c = 0; c < rope; ++c) dot += query[nope+c]*latent_f32(row[latent+c]);
         probs[s] = dot*scale;
     }
     __syncthreads();
@@ -224,7 +229,7 @@ __global__ void mla_kernel(const float* q, const uint16_t* kb, const uint16_t* v
     for (int c = t; c < latent; c += NT) {
         float value = 0;
         for (int s = 0; s < nsel; ++s)
-            if (cells[s] >= 0) value += probs[s]*f32_from_f16(cache[(size_t) cells[s]*(latent+rope)+c]);
+            if (cells[s] >= 0) value += probs[s]*latent_f32(cache[(size_t) cells[s]*(latent+rope)+c]);
         ctx[c] = value;
     }
     __syncthreads();
