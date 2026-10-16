@@ -47,6 +47,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/glm_live_prefix.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1158,6 +1159,7 @@ static int glm_pack_generate(const Options& o) {
     };
 
     std::vector<int32_t> snap_tokens;   // the prompt prefix the model's saved state belongs to (conversation reuse)
+    strata::program::GlmLivePrefix full_live; // full DSA may also reuse consumed generated tokens
     // images (GENI): this request's <|image|> positions and rows, and a hash of the rows the saved state read - the
     // same tokens with another picture must not reuse it
     std::vector<int64_t> cur_img_pos;
@@ -1533,6 +1535,23 @@ static int glm_pack_generate(const Options& o) {
     };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
+        // Full DSA has no recurrent state: an exact common prefix of the live
+        // branch can reuse generated rows too, even if tool/template formatting
+        // changes a later suffix. Flash keeps its existing snapshot contract.
+        if (model.geometry().full_dsa && cur_img_pos.empty() && getenv("STRATA_GLM_NO_REUSE") == nullptr) {
+            const size_t common = full_live.match(prompt, model.position());
+            if (common > 0) {
+                if (!model.rewind_full_dsa((int64_t) common, err)) {
+                    full_live.clear();
+                    std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
+                    return 1;
+                }
+                reuse = common;
+            }
+        }
+        // From here a reset, cancellation or failure may overwrite rows. Only a
+        // terminal request may claim a known consumed prefix, including on cancellation.
+        full_live.clear();
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
         // restored when this prompt extends it - a chat's next turn reads only what is new
         strata::core::progress_at("the request: restoring a conversation");
@@ -1550,7 +1569,7 @@ static int glm_pack_generate(const Options& o) {
             }
         const size_t ck_len = ck >= 0 ? ckpts[(size_t) ck].tokens.size() : 0;
         bool from_ckpt = false;
-        if (snap_ok && snap_tokens.size() >= ck_len && model.snapshot_restore()) reuse = snap_tokens.size();
+        if (reuse == 0 && snap_ok && snap_tokens.size() >= ck_len && model.snapshot_restore()) reuse = snap_tokens.size();
         if (reuse == 0 && ck >= 0) {
             slot_put("");              // the conversation in the model goes on differently past the checkpoint: kept
             size_t slot_len = 0;       // a slot that holds more of this prompt is taken instead (below)
@@ -1755,7 +1774,7 @@ static int glm_pack_generate(const Options& o) {
         static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
         static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
         std::vector<int> gen_hist;
-        std::vector<int32_t> emitted;   // every token this request wrote (a PAUSE keeps the state they lead to)
+        std::vector<int32_t> emitted;   // raw output; reuse retains only the prefix the model actually consumed
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
         int guard_fired = 0;     // soft landings in this answer: a second loop ends it
         const auto looping = [&](int w) -> int {   // the pattern's period, 0 when the tail is not one
@@ -1929,6 +1948,8 @@ static int glm_pack_generate(const Options& o) {
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
         if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load());
+        if (model.geometry().full_dsa && cur_img_pos.empty() && getenv("STRATA_GLM_NO_REUSE") == nullptr)
+            full_live.keep(prompt, emitted, model.position());
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
         if (model.fast() && produced > 0) {
@@ -3052,6 +3073,7 @@ static int glm_pack_generate(const Options& o) {
                 continue;
             }
             std::vector<int32_t> t(t64.begin(), t64.end());
+            full_live.clear();                    // LOGP replaces the live generation branch
             snap_tokens.clear();                  // the saved state is LOGP's now, not a conversation's
             ckpt_drop_past(0);                    // ... and so are the caches the checkpoints stood on
             model.set_host_logits(true);

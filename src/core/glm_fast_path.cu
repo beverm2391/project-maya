@@ -6078,6 +6078,33 @@ void Glm5Model::snap_pool_copy(bool restore) {
     }
 }
 
+bool Glm5Model::rewind_full_dsa(int64_t position, std::string& err) {
+    err.clear();
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (!m->g_.full_dsa || m->fast_ == nullptr || position < 0 || position > m->pos_ || m->pos_ != pos_) {
+            err = "glm-dsa: rewind requires a retained prefix within every split part's current position";
+            return false;
+        }
+    }
+    // A cancelled decode may have queued work. Drain every part before changing
+    // positions, and leave all positions unchanged if any part reports an error.
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_);
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm-dsa rewind", err) || !m->fast_->route_ok(err)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
+    }
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        m->pos_ = position;
+        m->mtp_hx_pos_ = -1;
+        if (m->snap_pos_ > position) m->snap_pos_ = -1;
+        for (auto& checkpoint : m->ckpt_pos_) if (checkpoint > position) checkpoint = -1;
+    }
+    cudaSetDevice(dev_);
+    return true;
+}
+
 bool Glm5Model::snapshot_save() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;

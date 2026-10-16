@@ -245,6 +245,10 @@ public:
 
     /// The position the next token will occupy (tokens consumed since the last reset).
     int64_t position() const { return pos_; }
+    // Full DSA caches are append-only. Rewind only while the caller proves the
+    // retained token prefix is identical; later rows are overwritten on append.
+    // This invalidates logits: forward at least one token before sampling.
+    bool rewind_full_dsa(int64_t position, std::string& err);
     const Glm5Geometry& geometry() const { return g_; }
     /// The next decoded token is `tok` instead of the sampled one (once; -1 clears): the serve loop's thinking budget
     /// closes the reasoning block this way inside the running decode - the speculative loop takes it as the truth

@@ -772,6 +772,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  add_executable(glm_live_prefix_test tests/glm_live_prefix_test.cpp)
+  target_include_directories(glm_live_prefix_test PRIVATE include)
+  add_test(NAME glm_live_prefix_test COMMAND glm_live_prefix_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
