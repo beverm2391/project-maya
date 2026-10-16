@@ -463,9 +463,19 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
 // ================================ geometry ================================
 
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    out = Glm5Geometry{}; // do not carry one architecture's defaults into another load
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
-    const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
+    const auto* arch = g.get("general.architecture");
+    out.full_dsa = arch != nullptr && arch->s == "glm-dsa";
+    if (out.full_dsa) {
+        out.n_embd = 6144; out.n_layers = 78; out.q_lora = 2048;
+        out.qk_nope = 256; out.rope_dim = 64; out.hc = 1;
+        out.n_expert = 256; out.idx_kpool = 1; out.idx_select_tail = 0;
+        out.w_scale = 2.5f; out.swiglu_exp = out.swiglu_shexp = INFINITY;
+    }
+    const std::string p = out.full_dsa ? "glm-dsa." :
+                          g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
     const auto num = [&](const std::string& key, double def, bool& ok) -> double {
         const auto* v = g.get(p + key);
         if (!v) return def;
@@ -479,6 +489,11 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     };
     const auto arr_i = [&](const std::string& key, std::vector<int>& dst, int n_layers) {
         const auto* v = g.get(p + key);
+        strata::MetaValue complete;
+        // The generic GGUF directory keeps only 64 array entries. Full GLM has
+        // 78 trunk layers; query the complete array rather than treating it as absent.
+        if (v && v->type == strata::MetaType::ARRAY && v->items.size() < (size_t) n_layers &&
+            g.get_full(p + key, complete)) v = &complete;
         if (v && v->type == strata::MetaType::ARRAY && v->items.size() >= (size_t) n_layers)
             // the per-layer arrays count ALL blocks (the NextN layer included); the trunk uses
             // the first n_layers entries
@@ -500,6 +515,13 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     out.q_lora = (int) num("attention.q_lora_rank", out.q_lora, ok);
     out.kv_lora = (int) num("attention.kv_lora_rank", out.kv_lora, ok);
     out.qk_nope = (int) num("attention.key_length_mla", out.qk_nope, ok);
+    if (out.full_dsa) {
+        out.rope_dim = (int) num("rope.dimension_count", out.rope_dim, ok);
+        out.qk_nope -= out.rope_dim; // glm-dsa stores total Q/K width here
+        out.rope_base = (float) num("rope.freq_base", out.rope_base, ok);
+        const double factor = num("rope.scaling.factor", 1.0, ok);
+        out.rope_scale = factor > 0 ? (float) (1.0 / factor) : 1.0f;
+    }
     out.v_head = (int) num("attention.value_length_mla", out.v_head, ok);
     out.kda_head_dim = (int) num("kda.head_dim", out.kda_head_dim, ok);
     out.d_conv = (int) num("ssm.conv_kernel", out.d_conv, ok);
@@ -519,14 +541,14 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     out.n_shared = (int) num("expert_shared_count", out.n_shared, ok);
     out.n_ff_dense = (int) num("feed_forward_length", out.n_ff_dense, ok);
     out.dense_lead = (int) num("leading_dense_block_count", out.dense_lead, ok);
-    out.w_scale = (float) num("expert_weights_scale", 1.0, ok);
+    out.w_scale = (float) num("expert_weights_scale", out.w_scale, ok);
     out.norm_w = (int) num("expert_weights_norm", 1, ok);
     out.swiglu_exp = (float) num("swiglu_clamp_exp", out.swiglu_exp, ok);
     out.swiglu_shexp = (float) num("swiglu_clamp_shexp", out.swiglu_shexp, ok);
     if (const auto* v = g.get(p + "vocab_size")) out.n_vocab = (int) v->u;
 
     // the layer-type array: 0 marks a KDA (recurrent) layer
-    out.n_head_kv.assign((size_t) out.n_layers, 0);
+    out.n_head_kv.assign((size_t) out.n_layers, out.full_dsa ? out.n_head : 0);
     arr_i("attention.head_count_kv", out.n_head_kv, out.n_layers);
 
     // the per-layer indexer type (glm5-next.cpp L46-47: optional array, absent means every layer
@@ -536,6 +558,21 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     // silently mis-served.  (The llama.cpp loader also asserts these two invariants.)
     out.indexer_full.assign((size_t) out.n_layers, 1);
     arr_i("attention.indexer.types", out.indexer_full, out.n_layers);
+    if (out.full_dsa) {
+        const auto* scaling = g.get(p + "rope.scaling.type");
+        if ((scaling && scaling->s != "none" && scaling->s != "linear") ||
+            out.rope_dim != 64 || out.qk_nope != 192 || out.kv_lora != 512 || out.v_head != 256 ||
+            out.idx_key != 128 || out.idx_top_k <= 0 || out.idx_top_k > 2048 || out.hc != 1 || out.idx_kpool != 1 ||
+            out.n_head <= 0 || out.n_embd <= 0 || out.n_embd > strata::kernels::glmf::kMaxMoeEmbd ||
+            out.n_embd % 256 != 0 || out.n_exp_used != 8 ||
+            out.n_layers <= 0 || !out.indexer_full[0]) {
+            err = "glm-dsa: unsupported MLA/indexer geometry or RoPE scaling"; return false;
+        }
+        for (int il = 0; il < out.n_layers; ++il) if (out.is_recr(il)) {
+            err = "glm-dsa: recurrent layers are not supported"; return false;
+        }
+        return true;
+    }
     for (int il = 0; il < out.n_layers; ++il) {
         if (!out.is_recr(il) && !out.indexer_full[(size_t) il]) {
             err = "glm5_model: layer " + std::to_string(il) +
@@ -654,6 +691,7 @@ Glm5Model::~Glm5Model() {
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
     strata::GgufFile gguf(gguf_path);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
+    if (g_.full_dsa) { err = "glm-dsa: use a native pack, not the Flash F32 runner"; return false; }
     max_ctx_ = max_ctx;
     dev_ = 0;
     l0_ = 0;
@@ -1316,9 +1354,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // (KV streaming: VRAM slots for kv_cells positions; the prompt path borrows a staging copy of one layer's cache)
     const int64_t kv_cells = fast ? Glm5Model::kv_resident_cells(g.idx_kpool, max_ctx) : 0;
     const double lat_rows = (double) (kv_cells > 0 ? kv_cells : max_ctx);
-    const double lat = fast ? (double) g.kv_lora * lat_rows / 2 : (double) g.kv_lora * lat_rows;
+    const double lat = fast ? (double) (g.kv_lora + g.rope_dim) * lat_rows / 2 : (double) g.kv_lora * lat_rows;
     const size_t kv_stage = kv_cells > 0 ? (size_t) g.kv_lora * 2 * (size_t) max_ctx : 0;
-    const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
+    const double dsa_state = 4.0 * (lat + (g.full_dsa ? 1.0 : 2.0) * g.idx_key * (double) max_ctx +
+                                          (g.full_dsa ? 0.0 : (double) g.idx_key * max_pools));
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // a DFlash drafter (STRATA_GLM_DFLASH): its file and ring on the last part; every part keeps the verify window's
     // buffers - per KDA layer its state backup and the window's inputs, and ~32 MB of rows and logits
@@ -1355,7 +1394,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     bool mtp = false;
     double mtp_dense = 0;
     std::unique_ptr<strata::GgufFile> extra;
-    if (fast && n == 2 && getenv("STRATA_GLM_NO_MTP") == nullptr) {
+    if (fast && !g.full_dsa && n == 2 && getenv("STRATA_GLM_NO_MTP") == nullptr) {
         const std::string P = "blk." + std::to_string(L) + ".";
         const char* mg = getenv("STRATA_GLM_MTP_GGUF");
         if (find(P + "nextn.eh_proj.weight") == nullptr && mg != nullptr && mg[0] != '\0') try {
@@ -1600,6 +1639,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const double eps = 1e-6;
     std::vector<Eval> ev;
     const auto consider = [&]() {
+        if (g.full_dsa) for (int cut : b) if (!g.indexer_full[(size_t) cut]) return;
         double obj = 0, tie = 0;
         const bool ok = price(b, ev, obj, tie);
         if (split_log) {
@@ -1732,6 +1772,10 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // pools are per-part, so 2x capacity halves the demand reads).  STRATA_GLM_SPLIT=0 forces one
     // device; =<layer>[,<layer>..] pins the boundaries; STRATA_GLM_DEV1 picks the second device of a
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
+    std::vector<std::string> geometry_shards;
+    if (!pack_shard_names(pack_dir, geometry_shards, err)) return false;
+    strata::GgufFile geometry_file(pack_dir + "/../" + geometry_shards[0]);
+    if (!Glm5Geometry::from_gguf(geometry_file, g_, err)) return false;
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
     const auto ints = [](const std::string& s, std::vector<int>& out) {
@@ -1776,6 +1820,17 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
             bounds = {g_.n_layers / 2 +
                       (getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr ? 2 : 0)};
         if (bounds.empty()) bounds = glm_auto_bounds(pack_dir, g_.n_layers, devs);
+    }
+    if (g_.full_dsa && (spec.empty() || spec == "auto")) {
+        for (size_t i = 0; i < bounds.size(); ++i) {
+            const int lo = i == 0 ? 1 : bounds[i - 1] + 1;
+            const int hi = i + 1 < bounds.size() ? bounds[i + 1] - 1 : g_.n_layers - 1;
+            int best = -1;
+            for (int k = lo; k <= hi; ++k)
+                if (g_.indexer_full[(size_t) k] && (best < 0 || std::abs(k - bounds[i]) < std::abs(best - bounds[i]))) best = k;
+            if (best < 0) { err = "glm-dsa: no full-indexer split boundary available"; return false; }
+            bounds[i] = best;
+        }
     }
     if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr && !spec.empty() && spec != "auto")
         if (const char* d1 = getenv("STRATA_GLM_DEV1")) devs[1] = std::atoi(d1);
@@ -2598,6 +2653,18 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const std::string dir2 = pack_dir + "/..";   // the shards live beside the pack directory
     strata::GgufFile gguf(dir2 + "/" + shard_names[0]);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
+    if (g_.full_dsa) {
+        const auto enabled = [](const char* key) { const char* v = getenv(key); return v && std::atoi(v) != 0; };
+        if (getenv("STRATA_GLM_SLOW") || enabled("STRATA_GLM_KV_INT8") || kv_resident_cells(1, max_ctx) > 0 ||
+            enabled("STRATA_GLM_MTP") || getenv("STRATA_GLM_MTP_GGUF") || !dflash_path_.empty() ||
+            (getenv("STRATA_GLM_SEQS") && std::atoi(getenv("STRATA_GLM_SEQS")) > 1)) {
+            err = "glm-dsa: initial path requires token decode, one sequence, FP16 resident KV, and no drafter";
+            return false;
+        }
+        if (l0 > 0 && (l0 >= g_.n_layers || !g_.indexer_full[(size_t) l0])) {
+            err = "glm-dsa: split must start at a full indexer layer"; return false;
+        }
+    }
     max_ctx_ = max_ctx;
     l0_ = l0;
     l1_ = l1 > 0 ? l1 : g_.n_layers;
@@ -2799,6 +2866,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
+    if (g_.full_dsa && exl3_) { err = "glm-dsa: initial full-model path requires a native GGUF pack"; return false; }
     if (exl3_ && !fast_mode_) {
         err = "pack: an EXL3 model runs on the fast path only (unset STRATA_GLM_SLOW)";
         return false;
@@ -3027,7 +3095,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // fits), or a more precise block than the model's own: load_mtp looks there first.
     bool mtp_extra = false;
     const char* mtp_gguf = getenv("STRATA_GLM_MTP_GGUF");
-    if (fast_mode_ && l1_ == g_.n_layers && mtp_gguf != nullptr && mtp_gguf[0] != '\0') {
+    if (fast_mode_ && !g_.full_dsa && l1_ == g_.n_layers && mtp_gguf != nullptr && mtp_gguf[0] != '\0') {
         const bool own = find_tensor("blk." + std::to_string(g_.n_layers) + ".nextn.eh_proj.weight") != nullptr;
         auto extra = std::make_unique<strata::GgufFile>(mtp_gguf);
         if (extra->find("blk." + std::to_string(g_.n_layers) + ".nextn.eh_proj.weight") == nullptr) {
@@ -3047,7 +3115,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded; one GPU loads it
     // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
     const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_);
-    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
+    if (fast_mode_ && !g_.full_dsa && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
         (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
@@ -3078,7 +3146,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
     const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
-                               : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
+                               : fast_mode_ ? (int64_t) (g_.kv_lora + g_.rope_dim) * lat_rows / 2
                                             : (int64_t) g_.kv_lora * lat_rows;
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
@@ -3091,7 +3159,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     dsa_pool_.assign((size_t) g_.n_layers + 1, 0);
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
-    ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
+    ik_ring_ = fast_mode_ && !g_.full_dsa ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
     if (mtp_il_ >= 0) {
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;
@@ -3112,6 +3180,13 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         } else {
             dsa_lat_[(size_t) il] = floats;
             floats += lat_floats;
+            if (g_.full_dsa) {
+                if (g_.indexer_full[(size_t) il]) {
+                    dsa_ik_[(size_t) il] = floats;
+                    floats += (int64_t) g_.idx_key * max_ctx;
+                }
+                continue; // no compressor gates or pooled keys in glm-dsa
+            }
             dsa_ik_[(size_t) il] = floats;
             floats += (int64_t) g_.idx_key * ik_ring_;
             dsa_ig_[(size_t) il] = floats;

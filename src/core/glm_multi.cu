@@ -210,6 +210,7 @@ bool Glm5Model::seq_pipe_ready(std::string& err) {
 }
 
 bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::SamplerParams& sp, std::string& err) {
+    if (g_.full_dsa) { err = "glm-dsa: batched/speculative sequence execution is not supported yet"; return false; }
     if (s < 0 || s >= seq_count() || seq_.empty()) {
         err = "glm multi: no sequence " + std::to_string(s);
         return false;

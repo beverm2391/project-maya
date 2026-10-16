@@ -273,6 +273,7 @@ struct Glm5Model::FastState {
     void* gated_q = nullptr;
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
+    float* full_attn = nullptr; // full glm-dsa value rows before activation quantization
     int* cells = nullptr;
     int* slot_cells = nullptr;   // KV streaming: the selection in VRAM slot rows (glm_kv_resolve), what the attention reads
     void *qr_q = nullptr, *attn_q = nullptr;
@@ -370,6 +371,7 @@ struct Glm5Model::FastState {
         const uint16_t *idx_k = nullptr, *idx_gate = nullptr, *idx_q_b = nullptr, *idx_proj = nullptr;
         const uint16_t *k_b = nullptr, *v_b = nullptr;
         const uint16_t* router = nullptr;
+        const float* router_f32 = nullptr;
         const float* router_bias = nullptr;
         WSlot sh_gate, sh_up, sh_down;
         WSlot ffn_gate, ffn_up, ffn_down;

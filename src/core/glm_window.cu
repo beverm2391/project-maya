@@ -100,6 +100,7 @@ void kda_token(Glm5Model::FastState* F, const Glm5Model::FastState::Layer& Ly, c
 }  // namespace
 
 bool Glm5Model::win_alloc(int tmax, std::string& err) {
+    if (g_.full_dsa) { err = "glm-dsa: batched/speculative sequence execution is not supported yet"; return false; }
     FastState* F = fast_;
     auto& W = F->win;
     if (W.tmax >= tmax) return true;
@@ -929,6 +930,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
 
 bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& err,
                        const strata::kernels::SamplerParams* sp) {
+    if (g_.full_dsa) { err = "glm-dsa: batched/speculative sequence execution is not supported yet"; return false; }
     if (fast_ == nullptr || T < 1 || T > kWinMax) {
         err = "glm window: needs the fast path and 1.." + std::to_string(kWinMax) + " tokens";
         return false;
@@ -1256,6 +1258,7 @@ static bool win_threads_on() {
 
 bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::kernels::SamplerParams* sp,
                                bool fresh) {
+    if (g_.full_dsa) { err = "glm-dsa: batched/speculative sequence execution is not supported yet"; return false; }
     if (fast_ == nullptr) {
         err = "glm window: needs the fast path";
         return false;

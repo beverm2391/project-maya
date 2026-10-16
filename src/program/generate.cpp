@@ -961,7 +961,7 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
-// ================================ the glm5-next pack path (M3.1) ================================
+// ================================ the GLM pack path ================================
 //
 // A GLM-5.3-Flash pack (tools/iq_pack.py output) runs the VERIFIED runner - Glm5Model, the same
 // path glm_pack_test drives (docs/GLM5-FLASH.md §9) - behind this driver's wire contract:
@@ -1017,6 +1017,15 @@ static int glm_pack_generate(const Options& o) {
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
         return 1;
+    }
+    // Full GLM currently uses the same tiered expert engine with a single-token
+    // DSA path. Flash's speculative/window and image paths have different state
+    // layouts; accepting their switches would make an apparently healthy server
+    // execute the wrong model. Keep this boundary explicit until each is ported.
+    if (model.geometry().full_dsa && (o.vision || o.spec > 1 || !o.dflash.empty())) {
+        std::fprintf(stderr, "maya generate: glm-dsa currently requires text-only, non-speculative decoding "
+                             "(--spec 1, no --vision or --dflash)\n");
+        return 2;
     }
     const int64_t n_vocab = model.geometry().n_vocab;
     // the driver samples on the device (sample_token), so the fast path never downloads the logits
@@ -3959,11 +3968,11 @@ int main(int argc, char** argv) {
             // (docs/GLM5-FLASH.md; Glm5Geometry::from_gguf detects them the same way).
             if (const strata::MetaValue* v = model_gguf.get("general.architecture");
                 v != nullptr && v->type == strata::MetaType::STRING &&
-                (v->s == "glm5-next" || v->s == "glm5next")) {
+                (v->s == "glm5-next" || v->s == "glm5next" || v->s == "glm-dsa")) {
                 // this GGUF belongs to the GLM runner, not the qwen4exp session/graph machinery:
                 // point at the pack path instead of dying inside check_all with shape mismatches.
                 std::fprintf(stderr,
-                             "maya generate: %s declares architecture %s (GLM-5.3-Flash)\n"
+                             "maya generate: %s declares architecture %s (GLM)\n"
                              "maya generate: the qwen4exp driver path cannot serve it - run the pack instead:\n"
                              "maya generate:   strata generate --glm-pack <pack_dir> --tokens ... (the verified\n"
                              "maya generate:   Glm5Model runner; docs/GLM5-FLASH.md §9)\n",

@@ -221,10 +221,13 @@ struct MoeDev {
     unsigned int mt_xq_s = 0, mt_hq_s = 0, mt_sh_hq_s = 0, mt_out_s = 0, mt_cpu_s = 0;
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
+// Host/device routing ABI: Flash has 4096 hidden values, full GLM has 6144.
+// Keep one explicit bound for every mapped request/answer payload.
+constexpr int kMaxMoeEmbd = 8192;
 struct CpuAnswer {
     volatile unsigned int seq;
     unsigned int pad[3];
-    float part[4096];
+    float part[kMaxMoeEmbd];
 };
 constexpr int kRingSize = 64;
 /// LOOKAHEAD: a route may also carry the top-k of the next (up to) kAhead layers' routers applied to its FFN input.
@@ -251,7 +254,7 @@ struct MoeRequest {
     short near_ids[16];          // STRATA_GLM_ROUTE_LOG only: the route's next ranks after the top k (-1: none)
     int win;                     // ... and the answer slot they go to: a verify window's token (0: the lone answer)
     int win_n;                   // a batched verify window's tokens (0: not one): their CPU lanes may run at once
-    float x[4096];               // the FFN input, written only when cpu_mask != 0
+    float x[kMaxMoeEmbd];               // the FFN input, written only when cpu_mask != 0
 };
 /// The host's answer to a request with misses.
 struct MoeResponse {
@@ -262,7 +265,7 @@ struct MoeResponse {
     int upd_key[64];
     unsigned long long upd_val[64];
     int cpu;                          // 1: cpu_part (host-mapped, below) holds the missed experts' weighted sum
-    float cpu_part[4096];
+    float cpu_part[kMaxMoeEmbd];
 };
 /// Router (sigmoid + bias, stable top-k, normalised weights - router_sigmoid's arithmetic), the plan
 /// lookup in `tab`, the request publish, and the shared expert's swiglu + q8_1.

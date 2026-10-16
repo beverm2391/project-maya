@@ -62,6 +62,9 @@ struct WSlot {
 /// the released GLM-5.3-Flash values as defaults (mirrors ref/glm.py::Glm5Config - the Python and
 /// C++ readers must agree key for key, which glm_model_test checks against the dumps).
 struct Glm5Geometry {
+    bool full_dsa = false; // glm-dsa uses ordinary residuals and unpooled shared indexers
+    int rope_dim = 0;
+    float rope_base = 8000000.0f, rope_scale = 1.0f;
     int n_embd = 4096, n_layers = 45, n_head = 64, n_vocab = 154880;
     int nextn = 0;                     // NextN/MTP layers counted INSIDE block_count (unsloth
                                        // ships 46 with nextn 1); tensors of blk.{n_layers}+ are
@@ -84,7 +87,7 @@ struct Glm5Geometry {
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
-    int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
+    int n_sel_max() const { return full_dsa ? idx_top_k : idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
     bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
@@ -475,7 +478,9 @@ public:
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
     bool fast_token(int32_t token, std::string& err);
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
-    bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
+    bool fast_dsa(int il, int64_t p, std::string& err);
+    bool fast_full_dsa(int il, int64_t p, std::string& err);
+    bool fast_full_layers(int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_moe(int il, bool& pf_pending, std::string& err);   // one MoE FFN (x -> ffn)
     // ... its routed experts, once the router and the shared expert's gate / up have run: the token path's own
     // activations, or one row of a batched step's (multi_rows)

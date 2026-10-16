@@ -397,9 +397,9 @@ DFLASH = {"repo": "Anbeeld/GLM-5.3-Flash-DFlash2-GGUF", "revision": "f3569acb7f9
           "file": "GLM-5.3-Flash-DFlash2-Q4_K_M.gguf", "bytes": 697017248,
           "sha256": "f4158ffb805b26c4fe439669c2009908a80ea89e1576ecea4d03eaded18f017c",
           "license": "CC BY-NC-ND 4.0"}   # (the repo's: non-commercial use only, shown wherever it is offered)
-DRAFTS = ("mtp", "dflash2")                        # the setup's drafting choices; MTP the default
+DRAFTS = ("mtp", "dflash2", "none")                # Flash defaults to MTP; full GLM requires none
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
-GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
+GLM_ARCHS = ("glm5-next", "glm5next", "glm-dsa")    # Flash spellings and the full model
 # the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
 # its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
 PROFILE = ROOT / "data" / "expert-profile-glm.bin"
@@ -1043,7 +1043,8 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
              "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one "
              "RTX 3090. A speed calibration then measures it against the MTP block on this PC (5-20 minutes) and "
              "keeps it only if it is faster here. The drafter's license is "
-             f"{DFLASH['license']}: non-commercial use only.")]
+             f"{DFLASH['license']}: non-commercial use only."),
+            ("no drafting", None, "Plain autoregressive decode without an MTP or external drafter.")]
     pick = choose("Drafting?", ["How the model drafts tokens ahead (the answers are the same either way):"], rows,
                   DRAFTS.index(default), a.yes)
     return DRAFTS[pick]
@@ -1055,7 +1056,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     if a.gguf_dir:
         first, why = local_first(Path(a.gguf_dir))
         if first is None:
-            fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files, or the (first) .gguf file")
+            fail(why, "--gguf-dir takes the folder that holds the GLM .gguf files, or the (first) .gguf file")
         return "local", first
     hip = getattr(a, "backend", None) == "hip"
     if a.model:
@@ -1443,7 +1444,7 @@ def gguf_head(path: Path) -> tuple:
 
 
 def glm_files(d: Path) -> list:
-    """The GLM-5.3-Flash models in the folder `d`, as their first files (-00001-of- for a split one).  A single file
+    """The supported GLM models in the folder `d`, as their first files (-00001-of- for a split one).  A single file
     without tensors (a vocabulary, like the vision folder's) is no model; unsloth's split models keep only metadata
     in their first file."""
     try:
@@ -1468,14 +1469,14 @@ def local_first(p: Path) -> tuple:
         first = shard_set(p)[0]
         arch = gguf_head(first)[0] if first.exists() else ""
         if first.exists() and arch not in GLM_ARCHS:
-            return None, f"{first.name} is " + (f"a {arch!r} model, not GLM-5.3-Flash ({GLM_ARCHS[0]})" if arch else
+            return None, f"{first.name} is " + (f"a {arch!r} model, not a supported GLM model ({', '.join(GLM_ARCHS)})" if arch else
                                                 "not a GGUF file")
         return first, None
     found = glm_files(p) if p.is_dir() else []
     if not found:
-        return None, (f"no GLM-5.3-Flash GGUF file in {p}" if p.is_dir() else f"{p} does not exist")
+        return None, (f"no supported GLM GGUF file in {p}" if p.is_dir() else f"{p} does not exist")
     if len(found) > 1:
-        return None, f"{p} holds {len(found)} GLM-5.3-Flash models: name the file (" + \
+        return None, f"{p} holds {len(found)} GLM models: name the file (" + \
                      ", ".join(f.name for f in found) + ")"
     return found[0], None
 
@@ -1617,7 +1618,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
 
 def model_step(a, models: Path, choice: tuple):
     """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
-    step(5, "the model (GLM-5.3-Flash)")
+    step(5, "the model (GLM-5.3)")
     kind, what = choice
     if kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
@@ -1644,7 +1645,7 @@ def model_step(a, models: Path, choice: tuple):
         from gguf_reader import GGUFFile
         arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
         if arch not in GLM_ARCHS:
-            fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
+            fail(f"{shards[0].name} is a {arch!r} model, not a supported GLM model ({', '.join(GLM_ARCHS)})")
     gb = sum(s.stat().st_size for s in shards) / 1e9
     ok(f"{quant}: {len(shards)} file(s), {gb:.1f} GB in {d}")
     if rotational(d):
@@ -1748,8 +1749,8 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
     say("  Writing the index of every tensor, the small float weights (about 1 GB) and the tokenizer; the experts")
     say("  stay in the GGUF files (a few minutes) ...")
     env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
-    # --compat-bf16: the GLM pack stores the projections its kernels read as BF16 (router, indexer, absorbed MLA,
-    # KDA gates) in BF16 even where the GGUF quantized them or keeps them F32 (tools/iq_pack.py GLM5NEXT_BF16)
+    # --compat-bf16 uses the architecture's kernel precision contract. Flash includes
+    # mHC/KDA/router weights; full GLM converts only indexer and absorbed MLA projections.
     run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
          "--compat-bf16"], env=env)
     missing = [f for f in PACK_FILES if not (pack / f).exists()]
@@ -1910,6 +1911,11 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                  choice: tuple | None = None, dflash: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
+    local = choice[1] if choice and choice[0] == "local" else None
+    full_dsa = local is not None and gguf_head(local)[0] == "glm-dsa"
+    draft = "none" if full_dsa else getattr(a, "selected_draft", None) or ("dflash2" if dflash else "mtp")
+    if full_dsa and (dflash is not None or vision is not None or getattr(a, "parallel", None) not in (None, 1)):
+        fail("full GLM-5.3 requires text-only plain decode with --parallel 1")
     # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
     # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
@@ -1920,9 +1926,18 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
            "port": port}
+    if full_dsa:
+        cfg["model_name"] = "glm-5.3"
+        cfg["architecture"] = "glm-dsa"
+    if draft == "none":
+        cfg["args"] += ["--spec", "1", "--suffix-draft", "0"]
     if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
         cfg["args"] += ["--dflash", str(dflash)]
     env = parse_env(a.env)
+    if draft == "none":
+        env["STRATA_GLM_NO_MTP"] = "1"
+    if full_dsa:
+        env["STRATA_GLM_KV_INT8"] = "0"
     if pc.get("backend") == "hip":
         cfg["backend"] = "hip"
         # Leave space for the Linux desktop. The engine sizes its prompt chunk from
@@ -1961,8 +1976,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     suffix = "-hip" if pc.get("backend") == "hip" else ""
     cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
-    local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
-    if PROFILE.exists():
+    if not full_dsa and PROFILE.exists():
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
         old = read_json(cfg_path).get("args") or []
@@ -1970,19 +1984,25 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
                           "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",
                           "--kv-resident"))
-        kept += keep_profile(old, cfg["args"])
+        if not full_dsa:
+            kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
-    if getattr(a, "parallel", None):
+    if full_dsa:
+        set_arg(cfg["args"], "--parallel", 1)
+        set_arg(cfg["args"], "--kv-streaming", "off")
+        set_arg(cfg["args"], "--prefill", "0")
+    elif getattr(a, "parallel", None):
         set_arg(cfg["args"], "--parallel", a.parallel)
     if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
         set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
         ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
-    for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
-        ok(line)
+    if not full_dsa:
+        for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
+            ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
     cfg["installer"] = {"models_dir": str(models), "quant": quant, "gguf": str(local) if local else None,
-                        "gguf_dir": str(gguf_dir) if gguf_dir else None, "draft": "dflash2" if dflash else "mtp",
+                        "gguf_dir": str(gguf_dir) if gguf_dir else None, "draft": draft,
                         "written": time.strftime("%Y-%m-%d %H:%M")}
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
@@ -2055,6 +2075,8 @@ def add_profile(cfg: dict) -> bool:
     """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
     would write it: an update restarts the installed config without setting up again.  True when `cfg` changed."""
     args = cfg.get("args")
+    if cfg.get("architecture") == "glm-dsa" or cfg.get("model_name") == "glm-5.3":
+        return False
     if not isinstance(args, list) or "--glm-pack" not in args[:-1] or "--expert-profile" in args or not PROFILE.exists():
         return False
     args += ["--expert-profile", str(PROFILE)]
@@ -2758,8 +2780,17 @@ def set_up(a, prev: dict) -> Path | None:
         ok(f"model: {choice[1]}, in {download_dir(models, choice[1])}")
     else:
         ok(f"model: {choice[1]} (yours)")
-    draft = choose_draft(a, pc, inst)
-    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
+    full_dsa = choice[0] == "local" and gguf_head(choice[1])[0] == "glm-dsa"
+    if full_dsa:
+        if getattr(a, "draft", None) not in (None, "none"):
+            fail("full GLM-5.3 supports --draft none only; its MTP and Flash DFlash2 are not implemented")
+        if getattr(a, "parallel", None) not in (None, 1):
+            fail("full GLM-5.3 supports --parallel 1 only")
+        draft = "none"
+    else:
+        draft = choose_draft(a, pc, inst)
+    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else
+                       "none" if draft == "none" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
     got = model_step(a, models, choice)                # 5
@@ -2768,7 +2799,13 @@ def set_up(a, prev: dict) -> Path | None:
     d, shards, quant = got
     dflash = drafter_step(models) if draft == "dflash2" else None
     pack = pack_step(a, d, shards, llama, quant)       # 6
-    vision = vision_step(a, pc, meta, llama, d, quant)  # 7
+    if full_dsa:
+        step(7, "images")
+        ok("full GLM-5.3: text only")
+        vision = None
+    else:
+        vision = vision_step(a, pc, meta, llama, d, quant)  # 7
+    a.selected_draft = draft
     cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash)   # 8
     if dflash is not None:                             # DFlash2: kept only if it makes THIS PC faster (measured)
         if getattr(a, "no_speed_calibration", False):
@@ -2829,11 +2866,11 @@ def main() -> int:
     ap.add_argument("--model", choices=list(MODELS), help=f"which download (default: asked, {next(iter(MODELS))} "
                                                           "recommended)")
     ap.add_argument("--draft", choices=list(DRAFTS),
-                    help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
+                    help="how the model drafts: none = plain decode, mtp = its MTP block (Flash default), dflash2 = a DFlash2 drafter "
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
     ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
                                                              "its 1.1 GB of files)")
-    ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "
+    ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash or full GLM-5.3 GGUF files you already have: the folder with all of them, "
                                        "or the .gguf file (the first one of a split model) when the folder holds "
                                        "several models; it must be writable - the pack is written inside it "
                                        "(without this option the setup lists the ones it finds in ~/models*)")
@@ -2895,7 +2932,7 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
-    say(f"Project Maya v{version} - GLM-5.3-Flash on your own GPU(s).")
+    say(f"Project Maya v{version} - GLM-5.3 on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
     if a.bench:
